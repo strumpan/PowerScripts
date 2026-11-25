@@ -278,11 +278,10 @@ function Read-ExcelSheet{
         $rowTag = (Find-XmlMatches $rowXml '^<[^>]+>').Value
         $rowReference = Get-Attribute $rowTag 'r'
         if ($rowReference -ne '') {
-            $nextRow = 0
-            if (-not [int]::TryParse($rowReference, [ref]$nextRow) -or $nextRow -le $rowNumber) {
+            if ($rowReference -notmatch '^\d{1,9}$' -or [int]$rowReference -le $rowNumber) {
                 throw "Ogiltigt radnummer '$rowReference' i '$Path'."
             }
-            $rowNumber = $nextRow
+            $rowNumber = [int]$rowReference
         } else {
             $rowNumber++
         }
@@ -335,7 +334,7 @@ function Read-ExcelSheet{
         if ($headers.ContainsKey($header)) { throw "Duplicerad kolumnrubrik '$header' i '$Path'." }
         $headers[$header] = $index
     }
-    if ($KeyName -and -not $headers.ContainsKey($KeyName)) { throw "Nyckelkolumn '$KeyName' saknas i '$Path'." }
+    if ($KeyName -and -not $headers.ContainsKey($KeyName)) { throw "Nyckelkolumn '$KeyName' saknas i '$Path' (blad '$actualSheet', rad $($rows[0].Number)). Hittade rubriker: $(@($headers.Keys | Sort-Object) -join ', ')." }
     
     $data = @{}
     $emptyKeys = 0
