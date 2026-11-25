@@ -3,8 +3,8 @@
     Compares two Excel files.
 
 .DESCRIPTION
-    Compares two Excel files using a unique key column.
-    Column order does not affect the comparision.
+    Compares two Excel files by worksheet row number or a unique key column.
+    Column order does not affect the comparison.
     Results are exported to a CSV file.
 
 .PARAMETER File1
@@ -14,7 +14,8 @@
     New Excel file
 
 .PARAMETER KeyColumn  
-    Column containing the unique record identifier
+    Optional column containing the unique record identifier. If omitted,
+    rows are compared by their Excel row numbers instead.
 
 .PARAMETER Sheet
     Name of the Excel woriksheet to compare.
@@ -27,6 +28,9 @@
 
 .EXAMPLE
     .\Compare-Excel.ps1 -File1 Old.xlsx -File2 New.xlsx -KeyColumn Id
+
+.EXAMPLE
+    .\Compare-Excel.ps1 -File1 Old.xlsx -File2 New.xlsx
 
 .EXAMPLE
     .\Compare-Excel.ps1 -Help
@@ -58,8 +62,7 @@ if ($Help -or $PSBoundParameters.Count -eq 0) {
 }
 
 if (-not $File1 -or
-    -not $File2 -or
-    -not $KeyColumn) {
+    -not $File2) {
     
     Write-Host "Missing required parameters."
     Show-Help
@@ -186,13 +189,16 @@ function Format-ExcelDate {
 function Get-ZipText {
     param(
         [string]$Path,
-        [string]$Entry
+        [string]$Entry,
+        [switch]$Optional
     )
 
+    $ErrorActionPreference = 'Continue'
     $result = tar.exe -xOf $Path $Entry 2>$null
 
     if ($LASTEXITCODE -ne 0) {
-        return ''
+        if ($Optional) { return '' }
+        throw "Kan inte läsa '$Entry' i '$Path'."
     }
 
     return ($result -join "`n")
@@ -202,7 +208,7 @@ function Get-ZipText {
 function Read-ExcelSheet{
 	param([string]$Path, [string]$SheetName, [string]$KeyName)
 
-	$stylesXml = Get-ZipText $Path 'xl/styles.xml'
+	$stylesXml = Get-ZipText $Path 'xl/styles.xml' -Optional
 
     $styleFormats = @{}
 
@@ -254,7 +260,7 @@ function Read-ExcelSheet{
     else { $entry = 'xl/' + $target }
     $entry = $entry.Replace('xl/../', '')
 
-    $sharedXml = Get-ZipText $Path 'xl/sharedStrings.xml' $true
+    $sharedXml = Get-ZipText $Path 'xl/sharedStrings.xml' -Optional
     $shared = @()
     foreach ($si in (Find-XmlMatches $sharedXml '(?s)<(?:\w+:)?si(?:\s[^>]*)?>(.*?)</(?:\w+:)?si>')) {
         $value = ''
@@ -266,8 +272,20 @@ function Read-ExcelSheet{
 
     $xml = Get-ZipText $Path $entry
     $rows = @()
+    $rowNumber = 0
     foreach ($rowMatch in (Find-XmlMatches $xml '(?s)<(?:\w+:)?row\b[^>]*(?:/>|>.*?</(?:\w+:)?row>)')) {
         $rowXml = $rowMatch.Value
+        $rowTag = (Find-XmlMatches $rowXml '^<[^>]+>').Value
+        $rowReference = Get-Attribute $rowTag 'r'
+        if ($rowReference -ne '') {
+            $nextRow = 0
+            if (-not [int]::TryParse($rowReference, [ref]$nextRow) -or $nextRow -le $rowNumber) {
+                throw "Ogiltigt radnummer '$rowReference' i '$Path'."
+            }
+            $rowNumber = $nextRow
+        } else {
+            $rowNumber++
+        }
         $cells = @{}
         foreach ($cell in (Find-XmlMatches $rowXml '(?s)<(?:\w+:)?c\b[^>]*(?:/>|>.*?</(?:\w+:)?c>)')) {
             $cellXml = $cell.Value
@@ -306,33 +324,37 @@ function Read-ExcelSheet{
 
             $cells[$index] = $value
         }
-        $rows += ,$cells
+        $rows += @{ Number = $rowNumber; Cells = $cells }
     }
     if ($rows.Count -eq 0) { throw "Bladet '$actualSheet' är tomt."}
 
     $headers = @{}
-    foreach ($index in $rows[0].Keys) {
-        $header = [string]$rows[0][$index]
+    foreach ($index in $rows[0].Cells.Keys) {
+        $header = [string]$rows[0].Cells[$index]
         if ($header -match '^\s*$') { continue }
         if ($headers.ContainsKey($header)) { throw "Duplicerad kolumnrubrik '$header' i '$Path'." }
         $headers[$header] = $index
     }
-    if (-not $headers.ContainsKey($KeyColumn)) { trow "Nyckelkolumn '$KeyColumn' saknas i '$Path'." }
+    if ($KeyName -and -not $headers.ContainsKey($KeyName)) { throw "Nyckelkolumn '$KeyName' saknas i '$Path'." }
     
     $data = @{}
     $emptyKeys = 0
     $duplicates = 0
 
     for ($i = 1; $i -lt $rows.Count; $i++) {
-        $raw = $rows[$i]
-        $key = [string]$raw[$headers[$keyColumn]]
-        if ($key -match '^\s*$') {
-            $emptyKeys++
-            $continue
-        }
-        if ($data.ContainsKey($key)) { 
-            $duplicates++ 
-            continue 
+        $raw = $rows[$i].Cells
+        if ($KeyName) {
+            $key = [string]$raw[$headers[$KeyName]]
+            if ($key -match '^\s*$') {
+                $emptyKeys++
+                continue
+            }
+            if ($data.ContainsKey($key)) {
+                $duplicates++
+                continue
+            }
+        } else {
+            $key = $rows[$i].Number
         }
         $record = @{}
         foreach ($header in $headers.Keys) { $record[$header] = [string]$raw[$headers[$header]] }
@@ -341,7 +363,7 @@ function Read-ExcelSheet{
     if ($emptyKeys -gt 0 -or $duplicates -gt 0) {
         throw "'$Path': $emptykeys rader med tom nyckel och $duplicates duplicerade nycklar. Ingen jämföreslse utfördes."
     }
-    return @{ Headers = $headers; Data = $data; Sheet = $actualSheet }
+    return @{ Headers = $headers; Data = $data; Sheet = $actualSheet; HeaderRow = $rows[0].Number; LastRow = $rowNumber }
 }
 
 function Csv-Field {
@@ -363,7 +385,7 @@ $a = Read-ExcelSheet $File1 $Sheet $KeyColumn
 $b = Read-ExcelSheet $File2 $Sheet $KeyColumn
 
 if ($Sheet -eq '' -and $a.Sheet -ne $b.Sheet){
-    Write.Warning "Första bladet har olika namn: '$($a.Sheet)' respektive '$($b.Sheet)'."
+    Write-Warning "Första bladet har olika namn: '$($a.Sheet)' respektive '$($b.Sheet)'."
 }
 $onlyA = @($a.Headers.Keys | Where-Object { $b.Headers.Keys -notcontains $_ })
 $onlyB = @($b.Headers.Keys | Where-Object { $a.Headers.Keys -notcontains $_ })
@@ -371,16 +393,29 @@ if ($onlyA.Count -gt 0 -or $onlyB.Count -gt 0) {
     throw "Kolumnuppsättningarna skiljer sig. Endast fil 1: $($onlyA -join ', '). Endast fil 2: $($onlyB -join ', ')."
 }
 
-$lines = @('"Key","Status","Column","OldValue","NewValue"')
+if ($KeyColumn) {
+    $lines = @('"Key","Status","Column","OldValue","NewValue"')
+} else {
+    $lines = @('"Row","Status","Column","OldValue","NewValue"')
+}
 $added = 0; $removed = 0; $changed = 0; $unchanged = 0
 foreach ($key in @((@($a.Data.Keys) + @($b.Data.Keys)) | Sort-Object -Unique)) {
-    if (-not $a.Data.ContainsKey($key)) {
+    $hasA = $a.Data.ContainsKey($key)
+    $hasB = $b.Data.ContainsKey($key)
+    $recordA = if ($hasA) { $a.Data[$key] } else { @{} }
+    $recordB = if ($hasB) { $b.Data[$key] } else { @{} }
+    if (-not $KeyColumn) {
+        $hasA = $key -gt $a.HeaderRow -and $key -le $a.LastRow
+        $hasB = $key -gt $b.HeaderRow -and $key -le $b.LastRow
+    }
+
+    if (-not $hasA) {
         $added++
         # $lines += ((Csv-Field $key) + ',"Added","","",""')
         foreach ($header in @($b.Headers.Keys | Sort-Object)) {
             if ($header -eq $KeyColumn) { continue }
             
-            $newValue = [string]$b.Data[$key][$header]
+            $newValue = [string]$recordB[$header]
             $lines += (
                 (Csv-Field $key) +
                 ',"Added",' +
@@ -389,14 +424,14 @@ foreach ($key in @((@($a.Data.Keys) + @($b.Data.Keys)) | Sort-Object -Unique)) {
                 (Csv-Field $newValue)
             )
         }
-    } elseif (-not $b.Data.ContainsKey($key)) {
+    } elseif (-not $hasB) {
         $removed++
         # $lines += ((Csv-Field $key) + ',"Removed","","",""')
 
         foreach ($header in @($a.Headers.Keys | Sort-Object)) {
             if ($header -eq $KeyColumn) { continue }
 
-            $oldValue = [string]$a.Data[$key][$header]
+            $oldValue = [string]$recordA[$header]
 
             $lines += (
                 (Csv-Field $key) +
@@ -410,8 +445,8 @@ foreach ($key in @((@($a.Data.Keys) + @($b.Data.Keys)) | Sort-Object -Unique)) {
         $different = $false
         foreach ($header in @($a.Headers.Keys | Sort-Object)) {
             if ($header -eq $KeyColumn) { continue }
-            $old = [string]$a.Data[$key][$header]
-            $new = [string]$b.Data[$key][$header]
+            $old = [string]$recordA[$header]
+            $new = [string]$recordB[$header]
             if ($old -cne $new) {
                 $different = $true
                 $lines += ((Csv-Field $key) + ',"Changed",' + (Csv-Field $header) + ',' + (Csv-Field $old) + ',' + (Csv-Field $new))
